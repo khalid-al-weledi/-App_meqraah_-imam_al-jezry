@@ -42,10 +42,10 @@ function getLanguage(value) {
   return ["ar", "am"].includes(value) ? value : "ar";
 }
 
-// إنشاء رمز طالب مرتبط بمعرف UUID
+// إنشاء رمز طالب مرتبط بمعرف الطالب
 function generateStudentCode(gender, studentId) {
   const prefix = gender === "FEMALE" ? "IF" : "IM";
-  const suffix = studentId
+  const suffix = String(studentId)
     .replace(/-/g, "")
     .slice(0, 8)
     .toUpperCase();
@@ -120,7 +120,7 @@ router.post("/register", async (req, res) => {
 
     const passwordHash = await hashPassword(data.password);
 
-    // إنشاء المستخدم باستخدام UUID الافتراضي في قاعدة البيانات
+    // إنشاء المستخدم
     const userResult = await client.query(
       `INSERT INTO users (
          full_name,
@@ -147,7 +147,7 @@ router.post("/register", async (req, res) => {
 
     const user = userResult.rows[0];
 
-    // إنشاء ملف الطالب. الرصيد محفوظ في student_profiles نفسه.
+    // إنشاء ملف الطالب، مع حفظ المدينة السابقة
     const temporaryCode = `TMP-${randomUUID()}`;
 
     const studentResult = await client.query(
@@ -159,6 +159,7 @@ router.post("/register", async (req, res) => {
          age,
          country,
          city,
+         previous_city,
          previous_school,
          previous_teacher,
          reading_level,
@@ -166,7 +167,7 @@ router.post("/register", async (req, res) => {
          memorized_juz
        )
        VALUES (
-         $1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11
+         $1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
        )
        RETURNING id, gender, balance_minutes`,
       [
@@ -176,6 +177,7 @@ router.post("/register", async (req, res) => {
         data.age ?? null,
         data.country ?? null,
         data.city ?? null,
+        data.previousCity ?? null,
         data.previousSchool ?? null,
         data.previousTeacher ?? null,
         data.readingLevel ?? null,
@@ -186,6 +188,7 @@ router.post("/register", async (req, res) => {
 
     const student = studentResult.rows[0];
     const studentId = student.id;
+
     const studentCode = generateStudentCode(
       student.gender,
       studentId
@@ -198,7 +201,7 @@ router.post("/register", async (req, res) => {
       [studentCode, studentId]
     );
 
-    // التأكد من أن جميع البرامج المطلوبة موجودة ومفعلة
+    // التأكد من أن البرامج المطلوبة موجودة ومفعلة
     const programResult = await client.query(
       `SELECT id, code
        FROM programs
@@ -229,7 +232,7 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // تسجيل طلب الالتحاق لكل برنامج
+    // إنشاء طلب التحاق لكل برنامج
     for (const programCode of programCodes) {
       await client.query(
         `INSERT INTO enrollments (
@@ -269,8 +272,7 @@ router.post("/register", async (req, res) => {
       ]
     );
 
-    // إنشاء الرمز قبل اعتماد المعاملة لتجنب نجاح التسجيل
-    // مع فشل إصدار الرمز بسبب إعدادات JWT.
+    // إصدار الرمز قبل اعتماد المعاملة
     const token = createToken({
       id: user.id,
       role: user.role
