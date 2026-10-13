@@ -2,12 +2,14 @@
 const express = require("express");
 const { randomUUID } = require("crypto");
 const { pool } = require("./db");
+
 const {
   createToken,
   hashPassword,
   verifyPassword,
   authenticateToken
 } = require("./security");
+
 const {
   registerSchema,
   loginSchema,
@@ -31,9 +33,13 @@ function validationResponse(res, errors) {
   });
 }
 
-// تطبيع رقم الهاتف
 function normalizePhone(phone) {
   return phone.replace(/[\s()-]/g, "");
+}
+
+function getLanguage(value) {
+  const allowedLanguages = ["ar", "am", "en", "om"];
+  return allowedLanguages.includes(value) ? value : "ar";
 }
 
 // إنشاء حساب طالب جديد
@@ -46,18 +52,45 @@ router.post("/register", async (req, res) => {
 
   const data = checked.data;
   const phone = normalizePhone(data.phone);
+  const programCodes = [...new Set(data.programCodes || [])];
+
+  if (programCodes.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: "يرجى اختيار برنامج واحد على الأقل."
+    });
+  }
+
+  const invalidCodes = programCodes.filter(
+    (code) => !PROGRAM_CODES.includes(code)
+  );
+
+  if (invalidCodes.length > 0) {
+    return res.status(400).json({
+      success: false,
+      message: "توجد رموز برامج غير صحيحة.",
+      invalidCodes
+    });
+  }
+
   const client = await pool.connect();
+  let transactionStarted = false;
 
   try {
     await client.query("BEGIN");
+    transactionStarted = true;
 
     const existing = await client.query(
-      "SELECT id FROM users WHERE phone = $1 LIMIT 1",
+      `SELECT id
+       FROM users
+       WHERE phone = $1
+       LIMIT 1`,
       [phone]
     );
 
     if (existing.rowCount > 0) {
       await client.query("ROLLBACK");
+      transactionStarted = false;
 
       return res.status(409).json({
         success: false,
@@ -66,24 +99,37 @@ router.post("/register", async (req, res) => {
     }
 
     const passwordHash = await hashPassword(data.password);
+    const language = getLanguage(data.language);
 
+    // اسم العمود الصحيح في قاعدة البيانات: preferred_language
     const userResult = await client.query(
       `INSERT INTO users
-        (full_name, phone, password_hash, role, language, is_active)
+        (
+          full_name,
+          phone,
+          password_hash,
+          role,
+          preferred_language,
+          is_active
+        )
        VALUES ($1, $2, $3, 'STUDENT', $4, TRUE)
-       RETURNING id, full_name, phone, role, language`,
+       RETURNING
+         id,
+         full_name,
+         phone,
+         role,
+         preferred_language`,
       [
         data.fullName,
         phone,
         passwordHash,
-        data.language
+        language
       ]
     );
 
     const user = userResult.rows[0];
 
-    // أنشئ الملف الشخصي أولًا بمعرّف يولّده PostgreSQL.
-    // نستخدم رمزًا مؤقتًا ثم نحدّثه داخل المعاملة نفسها.
+    // إنشاء الملف الشخصي برمز مؤقت داخل المعاملة نفسها
     const temporaryCode = `TMP-${randomUUID()}`;
 
     const studentResult = await client.query(
@@ -102,7 +148,7 @@ router.post("/register", async (req, res) => {
           memorized_juz
         )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING id`,
+       RETURNING id, gender`,
       [
         user.id,
         temporaryCode,
@@ -118,9 +164,12 @@ router.post("/register", async (req, res) => {
       ]
     );
 
-    const studentId = studentResult.rows[0].id;
-    const prefix = data.gender === "FEMALE" ? "IF" : "IM";
-    const studentCode = `${prefix}-${String(studentId).padStart(6, "0")}`;
+    const student = studentResult.rows[0];
+    const studentId = student.id;
+
+    const prefix = student.gender === "FEMALE" ? "IF" : "IM";
+    const studentCode =
+      `${prefix}-${String(studentId).padStart(6, "0")}`;
 
     await client.query(
       `UPDATE student_profiles
@@ -129,50 +178,72 @@ router.post("/register", async (req, res) => {
       [studentCode, studentId]
     );
 
+    // إنشاء حساب الدقائق الابتدائي
     await client.query(
-      `INSERT INTO minute_accounts (student_id, balance_minutes)
+      `INSERT INTO minute_accounts
+        (student_id, balance_minutes)
        VALUES ($1, 0)`,
       [studentId]
     );
 
+    // التحقق من البرامج المطلوبة باستخدام رموزها الفعلية
     const programResult = await client.query(
-      `SELECT code
+      `SELECT id, code
        FROM programs
        WHERE code = ANY($1::text[])
          AND is_active = TRUE`,
-      [data.programCodes]
+      [programCodes]
     );
 
-    const availableCodes = new Set(
-      programResult.rows.map((row) => row.code)
+    const availablePrograms = new Map(
+      programResult.rows.map((program) => [
+        program.code,
+        program.id
+      ])
     );
 
-    const unavailableCodes = data.programCodes.filter(
-      (code) => !availableCodes.has(code)
+    const unavailableCodes = programCodes.filter(
+      (code) => !availablePrograms.has(code)
     );
 
     if (unavailableCodes.length > 0) {
-      throw new Error(
-        `Selected programs are unavailable: ${unavailableCodes.join(", ")}`
-      );
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
+      return res.status(400).json({
+        success: false,
+        message: "بعض البرامج المختارة غير متاحة حاليًا.",
+        unavailableCodes
+      });
     }
 
-    for (const programCode of data.programCodes) {
-      if (!PROGRAM_CODES.includes(programCode)) {
-        throw new Error("Invalid program code.");
-      }
+    // جدول enrollments يستخدم program_id وليس program_code
+    for (const programCode of programCodes) {
+      const programId = availablePrograms.get(programCode);
 
       await client.query(
         `INSERT INTO enrollments
-          (student_id, program_code, status)
-         VALUES ($1, $2, 'PENDING')`,
-        [studentId, programCode]
+          (
+            student_id,
+            program_id,
+            status,
+            requested_at
+          )
+         VALUES ($1, $2, 'PENDING', NOW())`,
+        [studentId, programId]
       );
     }
 
+    // تسجيل العملية في سجل التدقيق
     await client.query(
       `INSERT INTO audit_logs
-        (actor_user_id, action, entity_type, entity_id, details)
+        (
+          actor_user_id,
+          action,
+          entity_type,
+          entity_id,
+          details
+        )
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
       [
         user.id,
@@ -181,12 +252,14 @@ router.post("/register", async (req, res) => {
         String(studentId),
         JSON.stringify({
           studentCode,
-          programCodes: data.programCodes
+          programCodes,
+          preferredLanguage: language
         })
       ]
     );
 
     await client.query("COMMIT");
+    transactionStarted = false;
 
     const token = createToken({
       id: user.id,
@@ -202,21 +275,23 @@ router.post("/register", async (req, res) => {
         fullName: user.full_name,
         phone: user.phone,
         role: user.role,
-        language: user.language
+        language: user.preferred_language
       },
       student: {
         id: studentId,
         studentCode,
-        gender: data.gender,
+        gender: student.gender,
         status: "PENDING"
       },
-      enrollments: data.programCodes.map((code) => ({
+      enrollments: programCodes.map((code) => ({
         programCode: code,
         status: "PENDING"
       }))
     });
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (transactionStarted) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
 
     console.error("Registration failed:", error.message);
 
@@ -248,7 +323,14 @@ router.post("/login", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, full_name, phone, password_hash, role, language, is_active
+      `SELECT
+         id,
+         full_name,
+         phone,
+         password_hash,
+         role,
+         preferred_language,
+         is_active
        FROM users
        WHERE phone = $1
        LIMIT 1`,
@@ -263,6 +345,7 @@ router.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+
     const passwordIsValid = await verifyPassword(
       checked.data.password,
       user.password_hash
@@ -289,7 +372,7 @@ router.post("/login", async (req, res) => {
         fullName: user.full_name,
         phone: user.phone,
         role: user.role,
-        language: user.language
+        language: user.preferred_language
       }
     });
   } catch (error) {
@@ -311,12 +394,13 @@ router.get("/me", authenticateToken, async (req, res) => {
          u.full_name,
          u.phone,
          u.role,
-         u.language,
+         u.preferred_language,
          u.is_active,
          sp.student_code,
          sp.gender
        FROM users u
-       LEFT JOIN student_profiles sp ON sp.user_id = u.id
+       LEFT JOIN student_profiles sp
+         ON sp.user_id = u.id
        WHERE u.id = $1
        LIMIT 1`,
       [req.user.id]
@@ -338,7 +422,7 @@ router.get("/me", authenticateToken, async (req, res) => {
         fullName: user.full_name,
         phone: user.phone,
         role: user.role,
-        language: user.language,
+        language: user.preferred_language,
         isActive: user.is_active,
         studentCode: user.student_code ?? null,
         gender: user.gender ?? null
