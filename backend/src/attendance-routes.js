@@ -14,8 +14,6 @@ const attendanceSchema = z.object({
   notes: z.string().trim().max(2000).optional().default("")
 });
 
-// PATCH /api/attendance/:sessionId
-// تسجيل الحضور وتحديث الرصيد داخل معاملة واحدة.
 router.patch(
   "/:sessionId",
   requireRoles("SUPER_ADMIN", "ACADEMIC_SUPERVISOR", "TEACHER"),
@@ -41,9 +39,11 @@ router.patch(
 
     const { status, actualMinutes, notes } = parsed.data;
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
       await client.query("BEGIN");
+      transactionStarted = true;
 
       const sessionResult = await client.query(
         `SELECT
@@ -62,6 +62,7 @@ router.patch(
 
       if (sessionResult.rowCount === 0) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
           success: false,
@@ -76,6 +77,7 @@ router.patch(
         String(session.teacher_id) !== String(req.user.id)
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(403).json({
           success: false,
@@ -89,10 +91,12 @@ router.patch(
         )
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(409).json({
           success: false,
-          message: "تم تسجيل حالة هذه الجلسة مسبقًا. يلزم إجراء تصحيح موثق بدل إعادة تسجيلها."
+          message:
+            "تم تسجيل حالة هذه الجلسة مسبقًا. يلزم إجراء تصحيح موثق بدل إعادة تسجيلها."
         });
       }
 
@@ -101,6 +105,7 @@ router.patch(
         (actualMinutes === undefined || actualMinutes < 1)
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
           success: false,
@@ -110,34 +115,49 @@ router.patch(
 
       if (
         status === "ATTENDED" &&
-        actualMinutes > Number(session.duration_minutes)
+        (
+          session.duration_minutes == null ||
+          actualMinutes > Number(session.duration_minutes)
+        )
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
           success: false,
-          message: "لا يمكن تسجيل دقائق تتجاوز مدة الجلسة المحددة."
+          message: "دقائق القراءة لا يمكن أن تتجاوز مدة الجلسة المحددة."
         });
       }
-
-      const updatedSession = await client.query(
-        `UPDATE sessions
-         SET status = $1,
-             notes = CASE
-               WHEN $2 = '' THEN notes
-               ELSE $2
-             END
-         WHERE id = $3
-         RETURNING id, student_id, teacher_id, status,
-                   duration_minutes, scheduled_at, notes`,
-        [status, notes, sessionId]
-      );
 
       let deductedMinutes = 0;
       let balanceAfter = null;
 
       if (status === "ATTENDED") {
-        const minutes = actualMinutes;
+        // مصدر الرصيد الأساسي: minute_accounts.
+        // قفل سجل الطالب أولًا لتوحيد ترتيب الأقفال مع اعتماد الدفع.
+        const profileResult = await client.query(
+          `SELECT id, balance_minutes
+           FROM student_profiles
+           WHERE id = $1
+           FOR UPDATE`,
+          [session.student_id]
+        );
+
+        if (profileResult.rowCount === 0) {
+          throw new Error("STUDENT_NOT_FOUND");
+        }
+
+        // لا ننسخ الرصيد القديم فوق حساب موجود، لأن الحساب قد يكون
+        // أحدث من الرصيد المخزن في student_profiles.
+        await client.query(
+          `INSERT INTO minute_accounts (student_id, balance_minutes)
+           VALUES ($1, $2)
+           ON CONFLICT (student_id) DO NOTHING`,
+          [
+            session.student_id,
+            Number(profileResult.rows[0].balance_minutes) || 0
+          ]
+        );
 
         const accountResult = await client.query(
           `SELECT balance_minutes
@@ -154,41 +174,90 @@ router.patch(
         const currentBalance = Number(
           accountResult.rows[0].balance_minutes
         );
+        const minutes = actualMinutes;
+
+        if (
+          !Number.isSafeInteger(currentBalance) ||
+          currentBalance < 0
+        ) {
+          throw new Error("INVALID_BALANCE");
+        }
 
         if (currentBalance < minutes) {
           await client.query("ROLLBACK");
+          transactionStarted = false;
 
           return res.status(409).json({
             success: false,
             code: "INSUFFICIENT_MINUTE_BALANCE",
-            message: "رصيد الطالب لا يكفي لتسجيل خصم هذه الجلسة. يلزم مراجعة الرصيد أو اعتماد إجراء مالي مناسب."
+            message:
+              "رصيد الطالب لا يكفي لتسجيل خصم هذه الجلسة. راجع الرصيد قبل اعتماد الحضور."
           });
         }
 
         const newBalance = currentBalance - minutes;
+        const deductionNote = `خصم دقائق جلسة القراءة رقم ${sessionId}`;
 
+        // تحديث الحساب الأساسي.
         await client.query(
           `UPDATE minute_accounts
-           SET balance_minutes = $1
+           SET balance_minutes = $1,
+               updated_at = NOW()
            WHERE student_id = $2`,
           [newBalance, session.student_id]
         );
 
+        // إبقاء العمود القديم متزامنًا حتى لا تتعطل التقارير الحالية.
         await client.query(
-          `INSERT INTO minute_ledger
-            (student_id, entry_type, minutes, description)
-           VALUES ($1, $2, $3, $4)`,
+          `UPDATE student_profiles
+           SET balance_minutes = $1
+           WHERE id = $2`,
+          [newBalance, session.student_id]
+        );
+
+        // تسجيل الحقول القديمة والجديدة لتوافق المسارات الحالية.
+        await client.query(
+          `INSERT INTO minute_ledger (
+             student_id,
+             entry_type,
+             amount_minutes,
+             minutes,
+             description,
+             note,
+             transaction_type,
+             minutes_delta,
+             balance_after,
+             notes,
+             actor_user_id,
+             created_by
+           )
+           VALUES ($1, $2, $3, $3, $4, $4, $2, $3, $5, $4, $6, $6)`,
           [
             session.student_id,
             "SESSION_DEDUCTION",
             -minutes,
-            `خصم دقائق جلسة القراءة رقم ${sessionId}`
+            deductionNote,
+            newBalance,
+            req.user.id
           ]
         );
 
         deductedMinutes = minutes;
         balanceAfter = newBalance;
       }
+
+      const updatedSession = await client.query(
+        `UPDATE sessions
+         SET status = $1,
+             notes = CASE
+               WHEN $2 = '' THEN notes
+               ELSE $2
+             END
+         WHERE id = $3
+         RETURNING id, student_id, teacher_id, status,
+                   duration_minutes, scheduled_at, notes`,
+        [status, notes, sessionId]
+      );
 
       await client.query(
         `INSERT INTO audit_logs
@@ -204,28 +273,31 @@ router.patch(
             status,
             actualMinutes: status === "ATTENDED" ? actualMinutes : 0,
             deductedMinutes,
+            balanceAfter,
             notes
           })
         ]
       );
 
       await client.query("COMMIT");
+      transactionStarted = false;
 
       return res.json({
         success: true,
-        message: status === "ATTENDED"
-          ? "تم تسجيل الحضور وخصم دقائق القراءة الفعلية."
-          : status === "ABSENT"
-            ? "تم تسجيل الغياب دون خصم دقائق."
-            : "تم إلغاء الجلسة دون خصم دقائق.",
+        message:
+          status === "ATTENDED"
+            ? "تم تسجيل الحضور وخصم دقائق القراءة الفعلية."
+            : status === "ABSENT"
+              ? "تم تسجيل الغياب دون خصم دقائق."
+              : "تم إلغاء الجلسة دون خصم دقائق.",
         session: updatedSession.rows[0],
         deductedMinutes,
         balanceAfter
       });
     } catch (error) {
-      try {
-        await client.query("ROLLBACK");
-      } catch (_) {}
+      if (transactionStarted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
 
       console.error("Attendance recording error:", error.message);
 
