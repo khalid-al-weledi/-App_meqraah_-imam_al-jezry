@@ -9,13 +9,10 @@ const {
 const router = express.Router();
 
 router.use(authenticateToken);
-
-router.use(
-  requireRoles("SUPER_ADMIN", "ACCOUNTANT")
-);
+router.use(requireRoles("SUPER_ADMIN", "ACCOUNTANT"));
 
 // GET /api/finance/summary
-// ملخص مالي للطلبات المعتمدة والمعلقة والمرفوضة.
+// ملخص طلبات الدفع والمبالغ.
 router.get("/summary", async (req, res) => {
   try {
     const result = await query(
@@ -58,7 +55,7 @@ router.get("/summary", async (req, res) => {
 });
 
 // GET /api/finance/ledger
-// عرض سجل الحركات المالية مع إمكانية تحديد طالب.
+// سجل حركات الدقائق مع إمكانية تحديد طالب.
 router.get("/ledger", async (req, res) => {
   const studentId = req.query.studentId
     ? Number(req.query.studentId)
@@ -103,12 +100,14 @@ router.get("/ledger", async (req, res) => {
          sp.student_code,
          u.full_name AS student_name,
          ml.entry_type,
-         ml.minutes,
-         ml.description,
+         ml.amount_minutes,
+         ml.note,
          ml.created_at
        FROM minute_ledger ml
-       JOIN student_profiles sp ON sp.id = ml.student_id
-       JOIN users u ON u.id = sp.user_id
+       JOIN student_profiles sp
+         ON sp.id = ml.student_id
+       JOIN users u
+         ON u.id = sp.user_id
        ${studentFilter}
        ORDER BY ml.created_at DESC, ml.id DESC
        LIMIT $${params.length}`,
@@ -131,7 +130,7 @@ router.get("/ledger", async (req, res) => {
 });
 
 // GET /api/finance/low-balances
-// قائمة الطلاب الذين لديهم رصيد منخفض.
+// الطلاب الذين وصل رصيدهم إلى الحد المحدد أو أقل.
 router.get("/low-balances", async (req, res) => {
   const threshold = req.query.threshold === undefined
     ? 10
@@ -157,8 +156,10 @@ router.get("/low-balances", async (req, res) => {
          u.phone,
          ma.balance_minutes
        FROM minute_accounts ma
-       JOIN student_profiles sp ON sp.id = ma.student_id
-       JOIN users u ON u.id = sp.user_id
+       JOIN student_profiles sp
+         ON sp.id = ma.student_id
+       JOIN users u
+         ON u.id = sp.user_id
        WHERE ma.balance_minutes <= $1
          AND u.is_active = TRUE
        ORDER BY ma.balance_minutes ASC, u.full_name ASC
