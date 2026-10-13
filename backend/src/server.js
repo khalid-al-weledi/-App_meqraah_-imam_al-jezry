@@ -7,6 +7,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
 const { checkDatabase } = require("./db");
+const authRoutes = require("./auth-routes");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
@@ -18,13 +19,16 @@ app.use(helmet());
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN.split(",").map((item) => item.trim())
+      ? process.env.CORS_ORIGIN
+          .split(",")
+          .map((item) => item.trim())
       : false
   })
 );
 
 app.use(express.json({ limit: "1mb" }));
 
+// حماية واجهات API من كثرة الطلبات
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -38,15 +42,22 @@ app.use(
   })
 );
 
+// واجهات التسجيل وتسجيل الدخول
+app.use("/api/auth", authRoutes);
+
+// الصفحة الرئيسية
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    name: process.env.APP_NAME || "مقرأة الإمام الجزري",
+    name:
+      process.env.APP_NAME ||
+      "مقرأة الإمام الجزري للإقراء والإجازة بالسند",
     message: "خادم المقرأة يعمل.",
     version: "1.0.0"
   });
 });
 
+// فحص حالة الخادم
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -54,6 +65,7 @@ app.get("/health", (req, res) => {
   });
 });
 
+// فحص اتصال قاعدة البيانات
 app.get("/health/database", async (req, res) => {
   try {
     const database = await checkDatabase();
@@ -64,7 +76,10 @@ app.get("/health/database", async (req, res) => {
       database: database.database_name
     });
   } catch (error) {
-    console.error("Database health check failed:", error.message);
+    console.error(
+      "Database health check failed:",
+      error.message
+    );
 
     res.status(503).json({
       success: false,
@@ -74,6 +89,7 @@ app.get("/health/database", async (req, res) => {
   }
 });
 
+// أي مسار غير معروف
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -81,6 +97,7 @@ app.use((req, res) => {
   });
 });
 
+// معالجة الأخطاء
 app.use((error, req, res, next) => {
   console.error("Server error:", error.message);
 
@@ -96,7 +113,9 @@ app.use((error, req, res, next) => {
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`Maqraah backend listening on port ${PORT}`);
+    console.log(
+      `Maqraah backend listening on port ${PORT}`
+    );
   });
 }
 
