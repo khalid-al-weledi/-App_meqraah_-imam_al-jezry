@@ -8,6 +8,14 @@ const phoneSchema = z
   .max(40, "رقم الهاتف طويل جدًا.")
   .regex(/^[+\d\s()-]+$/, "صيغة رقم الهاتف غير صحيحة.");
 
+const optionalText = (maxLength) =>
+  z
+    .string()
+    .trim()
+    .max(maxLength)
+    .optional()
+    .transform((value) => value === "" ? undefined : value);
+
 const registerSchema = z.object({
   fullName: z
     .string()
@@ -30,29 +38,35 @@ const registerSchema = z.object({
 
   age: z.coerce
     .number()
-    .int()
-    .min(3)
-    .max(120)
+    .int("يجب أن يكون العمر عددًا صحيحًا.")
+    .min(3, "العمر لا يمكن أن يقل عن 3 سنوات.")
+    .max(120, "العمر غير صحيح.")
     .optional(),
 
-  country: z.string().trim().max(100).optional(),
+  country: optionalText(100),
 
-  city: z.string().trim().max(100).optional(),
+  city: optionalText(100),
 
-  previousSchool: z.string().trim().max(200).optional(),
+  previousSchool: optionalText(200),
 
-  previousTeacher: z.string().trim().max(200).optional(),
+  previousTeacher: optionalText(200),
 
   readingLevel: z
-    .enum(["BEGINNER", "INTERMEDIATE", "VERY_GOOD", "ADVANCED"])
+    .enum([
+      "BEGINNER",
+      "INTERMEDIATE",
+      "VERY_GOOD",
+      "ADVANCED"
+    ])
     .optional(),
 
   hasReadQuranLooking: z.boolean().default(false),
 
   memorizedJuz: z.coerce
     .number()
-    .min(0)
-    .max(30)
+    .int("عدد الأجزاء يجب أن يكون عددًا صحيحًا.")
+    .min(0, "عدد الأجزاء لا يمكن أن يكون سالبًا.")
+    .max(30, "عدد الأجزاء لا يمكن أن يتجاوز 30.")
     .default(0),
 
   programCodes: z
@@ -66,6 +80,10 @@ const registerSchema = z.object({
     )
     .min(1, "يرجى اختيار برنامج واحد على الأقل.")
     .max(4)
+    .refine(
+      (codes) => new Set(codes).size === codes.length,
+      "لا يمكن اختيار البرنامج نفسه أكثر من مرة."
+    )
 }).strict();
 
 const loginSchema = z.object({
