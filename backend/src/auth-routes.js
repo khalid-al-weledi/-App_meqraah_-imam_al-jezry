@@ -1,15 +1,13 @@
 
 const express = require("express");
 const { randomUUID } = require("crypto");
-
 const { pool } = require("./db");
-
 const {
   createToken,
   hashPassword,
-  verifyPassword
+  verifyPassword,
+  authenticateToken
 } = require("./security");
-
 const {
   registerSchema,
   loginSchema,
@@ -18,7 +16,14 @@ const {
 
 const router = express.Router();
 
-function sendValidationError(res, errors) {
+const PROGRAM_CODES = [
+  "TALQEEN_CORRECTION",
+  "QURAN_HIFZ",
+  "HAFS_IJAZAH",
+  "SEVEN_QIRAAT"
+];
+
+function validationResponse(res, errors) {
   return res.status(400).json({
     success: false,
     message: "يرجى مراجعة البيانات المدخلة.",
@@ -26,27 +31,28 @@ function sendValidationError(res, errors) {
   });
 }
 
+// تطبيع رقم الهاتف
+function normalizePhone(phone) {
+  return phone.replace(/[\s()-]/g, "");
+}
+
 // إنشاء حساب طالب جديد
 router.post("/register", async (req, res) => {
   const checked = validate(registerSchema, req.body);
 
   if (!checked.success) {
-    return sendValidationError(res, checked.errors);
+    return validationResponse(res, checked.errors);
   }
 
   const data = checked.data;
+  const phone = normalizePhone(data.phone);
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    const phone = data.phone.replace(/[\s()-]/g, "");
-
     const existing = await client.query(
-      `SELECT id
-       FROM users
-       WHERE phone = $1
-       LIMIT 1`,
+      "SELECT id FROM users WHERE phone = $1 LIMIT 1",
       [phone]
     );
 
@@ -55,22 +61,17 @@ router.post("/register", async (req, res) => {
 
       return res.status(409).json({
         success: false,
-        message: "رقم الهاتف مسجل من قبل. يرجى تسجيل الدخول."
+        message: "رقم الهاتف مسجل مسبقًا. يرجى تسجيل الدخول."
       });
     }
 
     const passwordHash = await hashPassword(data.password);
 
     const userResult = await client.query(
-      `INSERT INTO users (
-         full_name,
-         phone,
-         password_hash,
-         role,
-         preferred_language
-       )
-       VALUES ($1, $2, $3, 'STUDENT', $4)
-       RETURNING id, full_name, phone, role, preferred_language`,
+      `INSERT INTO users
+        (full_name, phone, password_hash, role, language, is_active)
+       VALUES ($1, $2, $3, 'STUDENT', $4, TRUE)
+       RETURNING id, full_name, phone, role, language`,
       [
         data.fullName,
         phone,
@@ -81,41 +82,30 @@ router.post("/register", async (req, res) => {
 
     const user = userResult.rows[0];
 
-    const serialResult = await client.query(
-      `SELECT nextval(
-         pg_get_serial_sequence('student_profiles', 'id')
-       ) AS id`
-    );
+    // أنشئ الملف الشخصي أولًا بمعرّف يولّده PostgreSQL.
+    // نستخدم رمزًا مؤقتًا ثم نحدّثه داخل المعاملة نفسها.
+    const temporaryCode = `TMP-${randomUUID()}`;
 
-    const studentId = serialResult.rows[0].id;
-
-    const prefix = data.gender === "MALE" ? "IM" : "IF";
-
-    const studentCode =
-      prefix + "-" + String(studentId).padStart(6, "0");
-
-    await client.query(
-      `INSERT INTO student_profiles (
-         id,
-         user_id,
-         student_code,
-         gender,
-         age,
-         country,
-         city,
-         previous_school,
-         previous_teacher,
-         reading_level,
-         has_read_quran_looking,
-         memorized_juz
-       )
-       VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-       )`,
+    const studentResult = await client.query(
+      `INSERT INTO student_profiles
+        (
+          user_id,
+          student_code,
+          gender,
+          age,
+          country,
+          city,
+          previous_school,
+          previous_teacher,
+          reading_level,
+          has_read_quran_looking,
+          memorized_juz
+        )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id`,
       [
-        studentId,
         user.id,
-        studentCode,
+        temporaryCode,
         data.gender,
         data.age ?? null,
         data.country ?? null,
@@ -128,6 +118,17 @@ router.post("/register", async (req, res) => {
       ]
     );
 
+    const studentId = studentResult.rows[0].id;
+    const prefix = data.gender === "FEMALE" ? "IF" : "IM";
+    const studentCode = `${prefix}-${String(studentId).padStart(6, "0")}`;
+
+    await client.query(
+      `UPDATE student_profiles
+       SET student_code = $1
+       WHERE id = $2`,
+      [studentCode, studentId]
+    );
+
     await client.query(
       `INSERT INTO minute_accounts (student_id, balance_minutes)
        VALUES ($1, 0)`,
@@ -135,40 +136,43 @@ router.post("/register", async (req, res) => {
     );
 
     const programResult = await client.query(
-      `SELECT id, code
+      `SELECT code
        FROM programs
-       WHERE code = ANY($1::varchar[])
+       WHERE code = ANY($1::text[])
          AND is_active = TRUE`,
       [data.programCodes]
     );
 
-    if (programResult.rowCount !== data.programCodes.length) {
+    const availableCodes = new Set(
+      programResult.rows.map((row) => row.code)
+    );
+
+    const unavailableCodes = data.programCodes.filter(
+      (code) => !availableCodes.has(code)
+    );
+
+    if (unavailableCodes.length > 0) {
       throw new Error(
-        "One or more requested programs are unavailable."
+        `Selected programs are unavailable: ${unavailableCodes.join(", ")}`
       );
     }
 
-    for (const program of programResult.rows) {
+    for (const programCode of data.programCodes) {
+      if (!PROGRAM_CODES.includes(programCode)) {
+        throw new Error("Invalid program code.");
+      }
+
       await client.query(
-        `INSERT INTO enrollments (
-           student_id,
-           program_id,
-           status
-         )
-         VALUES ($1, $2, 'PENDING')
-         ON CONFLICT (student_id, program_id) DO NOTHING`,
-        [studentId, program.id]
+        `INSERT INTO enrollments
+          (student_id, program_code, status)
+         VALUES ($1, $2, 'PENDING')`,
+        [studentId, programCode]
       );
     }
 
     await client.query(
-      `INSERT INTO audit_logs (
-         actor_user_id,
-         action,
-         entity_type,
-         entity_id,
-         details
-       )
+      `INSERT INTO audit_logs
+        (actor_user_id, action, entity_type, entity_id, details)
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
       [
         user.id,
@@ -177,7 +181,7 @@ router.post("/register", async (req, res) => {
         String(studentId),
         JSON.stringify({
           studentCode,
-          requestedPrograms: data.programCodes
+          programCodes: data.programCodes
         })
       ]
     );
@@ -191,64 +195,60 @@ router.post("/register", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: "تم إنشاء الحساب وإرسال طلب التسجيل للمراجعة.",
+      message: "تم إنشاء الحساب بنجاح، وطلبات البرامج بانتظار المراجعة.",
       token,
       user: {
         id: user.id,
         fullName: user.full_name,
         phone: user.phone,
         role: user.role,
-        language: user.preferred_language
+        language: user.language
       },
       student: {
         id: studentId,
         studentCode,
         gender: data.gender,
-        balanceMinutes: 0
+        status: "PENDING"
       },
-      enrollmentStatus: "PENDING"
+      enrollments: data.programCodes.map((code) => ({
+        programCode: code,
+        status: "PENDING"
+      }))
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
 
-    console.error("Registration error:", error.message);
+    console.error("Registration failed:", error.message);
 
     if (error.code === "23505") {
       return res.status(409).json({
         success: false,
-        message: "يوجد حساب أو رقم طالب مسجل بهذه البيانات."
+        message: "البيانات مسجلة مسبقًا. تحقق من رقم الهاتف."
       });
     }
 
     return res.status(500).json({
       success: false,
-      message: "تعذر إتمام التسجيل حاليًا."
+      message: "تعذر إكمال التسجيل حاليًا."
     });
   } finally {
     client.release();
   }
 });
 
-// تسجيل الدخول برقم الهاتف وكلمة المرور
+// تسجيل الدخول
 router.post("/login", async (req, res) => {
   const checked = validate(loginSchema, req.body);
 
   if (!checked.success) {
-    return sendValidationError(res, checked.errors);
+    return validationResponse(res, checked.errors);
   }
 
-  const phone = checked.data.phone.replace(/[\s()-]/g, "");
+  const phone = normalizePhone(checked.data.phone);
 
   try {
     const result = await pool.query(
-      `SELECT
-         id,
-         full_name,
-         phone,
-         password_hash,
-         role,
-         preferred_language,
-         is_active
+      `SELECT id, full_name, phone, password_hash, role, language, is_active
        FROM users
        WHERE phone = $1
        LIMIT 1`,
@@ -263,13 +263,12 @@ router.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-
-    const passwordMatches = await verifyPassword(
+    const passwordIsValid = await verifyPassword(
       checked.data.password,
       user.password_hash
     );
 
-    if (!passwordMatches || !user.is_active) {
+    if (!passwordIsValid || !user.is_active) {
       return res.status(401).json({
         success: false,
         message: "رقم الهاتف أو كلمة المرور غير صحيحة."
@@ -290,11 +289,11 @@ router.post("/login", async (req, res) => {
         fullName: user.full_name,
         phone: user.phone,
         role: user.role,
-        language: user.preferred_language
+        language: user.language
       }
     });
   } catch (error) {
-    console.error("Login error:", error.message);
+    console.error("Login failed:", error.message);
 
     return res.status(500).json({
       success: false,
@@ -303,9 +302,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// معلومات الحساب الحالي
-const { authenticateToken } = require("./security");
-
+// بيانات الحساب الحالي
 router.get("/me", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -314,12 +311,12 @@ router.get("/me", authenticateToken, async (req, res) => {
          u.full_name,
          u.phone,
          u.role,
-         u.preferred_language,
-         s.student_code,
-         s.gender,
-         s.id AS student_id
+         u.language,
+         u.is_active,
+         sp.student_code,
+         sp.gender
        FROM users u
-       LEFT JOIN student_profiles s ON s.user_id = u.id
+       LEFT JOIN student_profiles sp ON sp.user_id = u.id
        WHERE u.id = $1
        LIMIT 1`,
       [req.user.id]
@@ -332,12 +329,23 @@ router.get("/me", authenticateToken, async (req, res) => {
       });
     }
 
+    const user = result.rows[0];
+
     return res.json({
       success: true,
-      user: result.rows[0]
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        phone: user.phone,
+        role: user.role,
+        language: user.language,
+        isActive: user.is_active,
+        studentCode: user.student_code ?? null,
+        gender: user.gender ?? null
+      }
     });
   } catch (error) {
-    console.error("Account lookup error:", error.message);
+    console.error("Get account failed:", error.message);
 
     return res.status(500).json({
       success: false,
