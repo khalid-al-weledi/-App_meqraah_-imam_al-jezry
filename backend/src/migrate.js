@@ -74,6 +74,19 @@ async function migrate() {
       )
     `);
 
+    // ترحيل آمن للجداول الموجودة:
+    // إضافة المدينة السابقة دون حذف أو استبدال أي بيانات.
+    await client.query(`
+      ALTER TABLE student_profiles
+      ADD COLUMN IF NOT EXISTS previous_city VARCHAR(100)
+    `);
+
+    await client.query(`
+      INSERT INTO schema_migrations (version)
+      VALUES ('002_previous_city')
+      ON CONFLICT (version) DO NOTHING
+    `);
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS programs (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -343,7 +356,7 @@ async function migrate() {
 
     console.log("Database migration completed successfully.");
   } catch (error) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Database migration failed:", error.message);
     throw error;
   } finally {
