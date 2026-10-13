@@ -35,7 +35,23 @@ function validPackageMinutes(value) {
     : null;
 }
 
-// عرض الباقات المتاحة من قاعدة البيانات
+function validOrderId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function sendError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message
+  });
+}
+
+// ======================================================
+// 1. عرض الباقات
+// GET /api/payments/packages
+// ======================================================
+
 router.get("/packages", async (req, res) => {
   try {
     const result = await pool.query(
@@ -50,22 +66,22 @@ router.get("/packages", async (req, res) => {
       currency: "ETB",
       packages: result.rows.map((item) => ({
         id: item.id,
-        minutes: item.minutes,
+        minutes: Number(item.minutes),
         priceETB: Number(item.price_etb)
       }))
     });
   } catch (error) {
     console.error("List packages failed:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      message: "تعذر جلب الباقات حاليًا."
-    });
+    return sendError(res, 500, "تعذر جلب الباقات حاليًا.");
   }
 });
 
-// إنشاء طلب شراء باقة.
-// لا تُضاف الدقائق عند إنشاء الطلب.
+// ======================================================
+// 2. إنشاء طلب شراء باقة
+// POST /api/payments/orders
+// لا تضاف الدقائق عند إنشاء الطلب.
+// ======================================================
+
 router.post(
   "/orders",
   authenticateToken,
@@ -78,18 +94,13 @@ router.post(
         ? req.body.paymentMethod.trim().toUpperCase()
         : "";
 
-    // receiptKey هو مفتاح الملف في خدمة تخزين موثوقة،
-    // وليس رابطًا عامًا يرسله الطالب.
     const receiptKey =
       typeof req.body?.receiptKey === "string"
         ? req.body.receiptKey.trim()
         : null;
 
     if (minutes === null) {
-      return res.status(400).json({
-        success: false,
-        message: "الباقة المحددة غير صالحة."
-      });
+      return sendError(res, 400, "الباقة المحددة غير صالحة.");
     }
 
     if (!PAYMENT_METHODS.includes(paymentMethod)) {
@@ -105,14 +116,10 @@ router.post(
       (
         receiptKey.length === 0 ||
         receiptKey.length > 500 ||
-        receiptKey.startsWith("http://") ||
-        receiptKey.startsWith("https://")
+        /^https?:\/\//i.test(receiptKey)
       )
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "مفتاح الإيصال غير صالح."
-      });
+      return sendError(res, 400, "مفتاح الإيصال غير صالح.");
     }
 
     const client = await pool.connect();
@@ -134,15 +141,15 @@ router.post(
         await client.query("ROLLBACK");
         transactionStarted = false;
 
-        return res.status(403).json({
-          success: false,
-          message: "لا يوجد ملف طالب مرتبط بهذا الحساب."
-        });
+        return sendError(
+          res,
+          403,
+          "لا يوجد ملف طالب مرتبط بهذا الحساب."
+        );
       }
 
       const studentId = studentResult.rows[0].id;
 
-      // نقرأ السعر من قاعدة البيانات ولا نعتمد على سعر يرسله العميل.
       const packageResult = await client.query(
         `SELECT id, minutes, price_etb
          FROM packages
@@ -156,47 +163,41 @@ router.post(
         await client.query("ROLLBACK");
         transactionStarted = false;
 
-        return res.status(400).json({
-          success: false,
-          message: "هذه الباقة غير متاحة حاليًا."
-        });
+        return sendError(
+          res,
+          400,
+          "هذه الباقة غير متاحة حاليًا."
+        );
       }
 
       const selectedPackage = packageResult.rows[0];
       const expectedPrice = PACKAGES[minutes];
 
-      // يمنع استمرار الطلب إذا خالفت بيانات الأسعار
-      // القيم المعتمدة حاليًا للمقرأة.
       if (Number(selectedPackage.price_etb) !== expectedPrice) {
-        console.error(
-          "Package price mismatch:",
-          selectedPackage.id
-        );
-
         await client.query("ROLLBACK");
         transactionStarted = false;
 
-        return res.status(503).json({
-          success: false,
-          message: "تعذر إتمام الطلب بسبب اختلاف سعر الباقة. يرجى مراجعة الإدارة."
-        });
+        return sendError(
+          res,
+          503,
+          "سعر الباقة في قاعدة البيانات لا يطابق السعر المعتمد. راجع الإدارة."
+        );
       }
 
       const idempotencyKey = randomUUID();
 
       const orderResult = await client.query(
-        `INSERT INTO payment_orders
-          (
-            student_id,
-            package_id,
-            amount_etb,
-            requested_minutes,
-            payment_method,
-            receipt_key,
-            status,
-            idempotency_key,
-            submitted_at
-          )
+        `INSERT INTO payment_orders (
+           student_id,
+           package_id,
+           amount_etb,
+           requested_minutes,
+           payment_method,
+           receipt_key,
+           status,
+           idempotency_key,
+           submitted_at
+         )
          VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, NOW())
          RETURNING
            id,
@@ -221,14 +222,13 @@ router.post(
       const order = orderResult.rows[0];
 
       await client.query(
-        `INSERT INTO audit_logs
-          (
-            actor_user_id,
-            action,
-            entity_type,
-            entity_id,
-            details
-          )
+        `INSERT INTO audit_logs (
+           actor_user_id,
+           action,
+           entity_type,
+           entity_id,
+           details
+         )
          VALUES ($1, $2, $3, $4, $5::jsonb)`,
         [
           req.user.id,
@@ -237,7 +237,7 @@ router.post(
           String(order.id),
           JSON.stringify({
             packageId: selectedPackage.id,
-            minutes: selectedPackage.minutes,
+            minutes: Number(selectedPackage.minutes),
             amountETB: Number(selectedPackage.price_etb),
             paymentMethod,
             hasReceipt: Boolean(receiptKey)
@@ -250,11 +250,12 @@ router.post(
 
       return res.status(201).json({
         success: true,
-        message: "تم إنشاء طلب الشراء. لن تُضاف الدقائق إلا بعد اعتماد الدفع.",
+        message:
+          "تم إنشاء طلب الشراء. لن تضاف الدقائق إلا بعد اعتماد الدفع.",
         order: {
           id: order.id,
           packageId: order.package_id,
-          minutes: order.requested_minutes,
+          minutes: Number(order.requested_minutes),
           amountETB: Number(order.amount_etb),
           paymentMethod: order.payment_method,
           hasReceipt: Boolean(order.receipt_key),
@@ -268,18 +269,18 @@ router.post(
       }
 
       console.error("Create payment order failed:", error.message);
-
-      return res.status(500).json({
-        success: false,
-        message: "تعذر إنشاء طلب الشراء."
-      });
+      return sendError(res, 500, "تعذر إنشاء طلب الشراء.");
     } finally {
       client.release();
     }
   }
 );
 
-// عرض طلبات الدفع للطالب الحالي
+// ======================================================
+// 3. طلبات الطالب
+// GET /api/payments/my-orders
+// ======================================================
+
 router.get(
   "/my-orders",
   authenticateToken,
@@ -311,7 +312,7 @@ router.get(
         orders: result.rows.map((order) => ({
           id: order.id,
           packageId: order.package_id,
-          minutes: order.requested_minutes,
+          minutes: Number(order.requested_minutes),
           amountETB: Number(order.amount_etb),
           paymentMethod: order.payment_method,
           hasReceipt: Boolean(order.receipt_key),
@@ -323,16 +324,16 @@ router.get(
       });
     } catch (error) {
       console.error("List payment orders failed:", error.message);
-
-      return res.status(500).json({
-        success: false,
-        message: "تعذر جلب طلبات الشراء."
-      });
+      return sendError(res, 500, "تعذر جلب طلبات الشراء.");
     }
   }
 );
 
-// عرض الطلبات للمحاسب والإدارة
+// ======================================================
+// 4. عرض طلبات الدفع للإدارة والمحاسب
+// GET /api/payments/admin/orders?status=PENDING
+// ======================================================
+
 router.get(
   "/admin/orders",
   authenticateToken,
@@ -343,7 +344,11 @@ router.get(
         .trim()
         .toUpperCase();
 
-      const validStatuses = ["PENDING", "APPROVED", "REJECTED"];
+      const validStatuses = [
+        "PENDING",
+        "APPROVED",
+        "REJECTED"
+      ];
 
       if (status && !validStatuses.includes(status)) {
         return res.status(400).json({
@@ -396,7 +401,7 @@ router.get(
         orders: result.rows.map((order) => ({
           id: order.id,
           packageId: order.package_id,
-          minutes: order.requested_minutes,
+          minutes: Number(order.requested_minutes),
           amountETB: Number(order.amount_etb),
           paymentMethod: order.payment_method,
           receiptKey: order.receipt_key,
@@ -411,31 +416,25 @@ router.get(
       });
     } catch (error) {
       console.error("Admin payment orders failed:", error.message);
-
-      return res.status(500).json({
-        success: false,
-        message: "تعذر جلب طلبات الدفع."
-      });
+      return sendError(res, 500, "تعذر جلب طلبات الدفع.");
     }
   }
 );
 
-/**
- * اعتماد طلب الدفع وإضافة الدقائق مرة واحدة فقط.
- * POST /api/payments/admin/orders/:id/approve
- */
+// ======================================================
+// 5. اعتماد طلب الدفع وإضافة الدقائق مرة واحدة
+// POST /api/payments/admin/orders/:id/approve
+// ======================================================
+
 router.post(
   "/admin/orders/:id/approve",
   authenticateToken,
   requireRoles("SUPER_ADMIN", "ACCOUNTANT"),
   async (req, res) => {
-    const orderId = Number(req.params.id);
+    const orderId = validOrderId(req.params.id);
 
-    if (!Number.isSafeInteger(orderId) || orderId <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "رقم الطلب غير صالح."
-      });
+    if (orderId === null) {
+      return sendError(res, 400, "رقم الطلب غير صالح.");
     }
 
     const client = await pool.connect();
@@ -445,7 +444,7 @@ router.post(
       await client.query("BEGIN");
       transactionStarted = true;
 
-      // قفل الطلب حتى لا تتم معالجته بالتزامن مرتين.
+      // قفل الطلب لمنع اعتماده بالتزامن مرتين.
       const orderResult = await client.query(
         `SELECT *
          FROM payment_orders
@@ -457,11 +456,7 @@ router.post(
       if (orderResult.rowCount === 0) {
         await client.query("ROLLBACK");
         transactionStarted = false;
-
-        return res.status(404).json({
-          success: false,
-          message: "طلب الدفع غير موجود."
-        });
+        return sendError(res, 404, "طلب الدفع غير موجود.");
       }
 
       const order = orderResult.rows[0];
@@ -470,18 +465,18 @@ router.post(
         await client.query("ROLLBACK");
         transactionStarted = false;
 
-        return res.status(409).json({
-          success: false,
-          message:
-            order.status === "APPROVED"
-              ? "تم اعتماد هذا الطلب سابقًا."
-              : "لا يمكن اعتماد طلب مرفوض."
-        });
+        return sendError(
+          res,
+          409,
+          order.status === "APPROVED"
+            ? "تم اعتماد هذا الطلب سابقًا."
+            : "لا يمكن اعتماد طلب مرفوض."
+        );
       }
 
-      // التحقق من تطابق بيانات الطلب مع الباقة المسجلة.
+      // التأكد من تطابق الطلب مع الباقة.
       const packageResult = await client.query(
-        `SELECT minutes, price_etb, is_active
+        `SELECT minutes, price_etb
          FROM packages
          WHERE id = $1`,
         [order.package_id]
@@ -502,63 +497,88 @@ router.post(
         throw new Error("ORDER_PACKAGE_MISMATCH");
       }
 
-      // قفل رصيد الطالب.
-      const studentResult = await client.query(
-        `SELECT id, balance_minutes
-         FROM student_profiles
-         WHERE id = $1
-         FOR UPDATE`,
-        [order.student_id]
-      );
-
-      if (studentResult.rowCount === 0) {
-        throw new Error("STUDENT_NOT_FOUND");
-      }
-
-      const student = studentResult.rows[0];
       const addedMinutes = Number(order.requested_minutes);
-      const currentBalance = Number(student.balance_minutes);
-      const newBalance = currentBalance + addedMinutes;
 
       if (
         !Number.isSafeInteger(addedMinutes) ||
-        !Number.isSafeInteger(newBalance) ||
         addedMinutes <= 0
       ) {
         throw new Error("INVALID_MINUTES");
       }
 
-      // تحديث الرصيد.
+      // إنشاء حساب دقائق عند عدم وجوده.
+      // يتطلب ذلك وجود قيد UNIQUE على student_id.
       await client.query(
-        `UPDATE student_profiles
-         SET balance_minutes = $1
-         WHERE id = $2`,
-        [newBalance, student.id]
+        `INSERT INTO minute_accounts (
+           student_id,
+           balance_minutes
+         )
+         VALUES ($1, 0)
+         ON CONFLICT (student_id) DO NOTHING`,
+        [order.student_id]
       );
 
-      // قيد UNIQUE على payment_order_id يمنع تسجيل الطلب مرتين.
+      // قفل حساب الطالب وقراءة الرصيد الحالي.
+      const accountResult = await client.query(
+        `SELECT balance_minutes
+         FROM minute_accounts
+         WHERE student_id = $1
+         FOR UPDATE`,
+        [order.student_id]
+      );
+
+      if (accountResult.rowCount === 0) {
+        throw new Error("MINUTE_ACCOUNT_NOT_FOUND");
+      }
+
+      const currentBalance = Number(
+        accountResult.rows[0].balance_minutes
+      );
+
+      const newBalance = currentBalance + addedMinutes;
+
+      if (
+        !Number.isSafeInteger(currentBalance) ||
+        currentBalance < 0 ||
+        !Number.isSafeInteger(newBalance)
+      ) {
+        throw new Error("INVALID_MINUTES");
+      }
+
+      // تحديث رصيد الدقائق.
+      await client.query(
+        `UPDATE minute_accounts
+         SET balance_minutes = $1,
+             updated_at = NOW()
+         WHERE student_id = $2`,
+        [newBalance, order.student_id]
+      );
+
+      // تسجيل حركة الشراء في سجل الدقائق.
+      // نستخدم idempotency_key الموجود في طلب الدفع.
       await client.query(
         `INSERT INTO minute_ledger (
            student_id,
-           payment_order_id,
-           transaction_type,
-           minutes_delta,
-           balance_after,
-           actor_user_id,
-           notes
+           amount_minutes,
+           note,
+           idempotency_key,
+           entry_type,
+           reference_type,
+           reference_id
          )
-         VALUES ($1, $2, 'PACKAGE_PURCHASE', $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
-          student.id,
-          order.id,
+          order.student_id,
           addedMinutes,
-          newBalance,
-          req.user.id,
-          `اعتماد شراء الباقة رقم ${order.package_id}`
+          `اعتماد شراء الباقة رقم ${order.package_id}`,
+          order.idempotency_key || randomUUID(),
+          "PACKAGE_PURCHASE",
+          "payment_order",
+          String(order.id)
         ]
       );
 
-      // اعتماد الطلب وتسجيل المراجع وتوقيت العملية.
+      // تحديث حالة الطلب.
       await client.query(
         `UPDATE payment_orders
          SET status = 'APPROVED',
@@ -569,6 +589,7 @@ router.post(
         [req.user.id, order.id]
       );
 
+      // تسجيل عملية الاعتماد.
       await client.query(
         `INSERT INTO audit_logs (
            actor_user_id,
@@ -584,7 +605,7 @@ router.post(
           "payment_order",
           String(order.id),
           JSON.stringify({
-            studentId: student.id,
+            studentId: order.student_id,
             minutesAdded: addedMinutes,
             previousBalance: currentBalance,
             newBalance,
@@ -612,59 +633,59 @@ router.post(
       console.error("Approve payment failed:", error.message);
 
       const knownErrors = {
-        PACKAGE_NOT_FOUND: "الباقة المرتبطة بالطلب غير موجودة.",
+        PACKAGE_NOT_FOUND:
+          "الباقة المرتبطة بالطلب غير موجودة.",
         ORDER_PACKAGE_MISMATCH:
           "بيانات الطلب لا تتطابق مع الباقة المسجلة.",
-        STUDENT_NOT_FOUND: "ملف الطالب غير موجود.",
-        INVALID_MINUTES: "عدد الدقائق أو الرصيد غير صالح."
+        MINUTE_ACCOUNT_NOT_FOUND:
+          "تعذر العثور على حساب دقائق الطالب.",
+        INVALID_MINUTES:
+          "عدد الدقائق أو الرصيد غير صالح."
       };
 
       if (knownErrors[error.message]) {
-        return res.status(409).json({
-          success: false,
-          message: knownErrors[error.message]
-        });
+        return sendError(res, 409, knownErrors[error.message]);
       }
 
-      return res.status(500).json({
-        success: false,
-        message: "تعذر اعتماد الدفع. لم تُحفظ التغييرات."
-      });
+      return sendError(
+        res,
+        500,
+        "تعذر اعتماد الدفع. تم التراجع عن تغييرات هذه المعاملة."
+      );
     } finally {
       client.release();
     }
   }
 );
 
+// ======================================================
+// 6. رفض طلب الدفع مع تسجيل السبب
+// POST /api/payments/admin/orders/:id/reject
+// Body: { "reason": "سبب الرفض" }
+// ======================================================
 
-/**
- * رفض طلب الدفع مع تسجيل السبب.
- * POST /api/payments/admin/orders/:id/reject
- * Body: { "reason": "سبب الرفض" }
- */
 router.post(
   "/admin/orders/:id/reject",
   authenticateToken,
   requireRoles("SUPER_ADMIN", "ACCOUNTANT"),
   async (req, res) => {
-    const orderId = Number(req.params.id);
+    const orderId = validOrderId(req.params.id);
+
     const reason =
       typeof req.body?.reason === "string"
         ? req.body.reason.trim()
         : "";
 
-    if (!Number.isSafeInteger(orderId) || orderId <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "رقم الطلب غير صالح."
-      });
+    if (orderId === null) {
+      return sendError(res, 400, "رقم الطلب غير صالح.");
     }
 
     if (!reason || reason.length > 1000) {
-      return res.status(400).json({
-        success: false,
-        message: "أدخل سبب الرفض، بحد أقصى 1000 حرف."
-      });
+      return sendError(
+        res,
+        400,
+        "أدخل سبب الرفض، بحد أقصى 1000 حرف."
+      );
     }
 
     const client = await pool.connect();
@@ -685,21 +706,18 @@ router.post(
       if (result.rowCount === 0) {
         await client.query("ROLLBACK");
         transactionStarted = false;
-
-        return res.status(404).json({
-          success: false,
-          message: "طلب الدفع غير موجود."
-        });
+        return sendError(res, 404, "طلب الدفع غير موجود.");
       }
 
       if (result.rows[0].status !== "PENDING") {
         await client.query("ROLLBACK");
         transactionStarted = false;
 
-        return res.status(409).json({
-          success: false,
-          message: "لا يمكن رفض طلب تمت مراجعته سابقًا."
-        });
+        return sendError(
+          res,
+          409,
+          "لا يمكن رفض طلب تمت مراجعته سابقًا."
+        );
       }
 
       await client.query(
@@ -744,11 +762,7 @@ router.post(
       }
 
       console.error("Reject payment failed:", error.message);
-
-      return res.status(500).json({
-        success: false,
-        message: "تعذر رفض طلب الدفع."
-      });
+      return sendError(res, 500, "تعذر رفض طلب الدفع.");
     } finally {
       client.release();
     }
