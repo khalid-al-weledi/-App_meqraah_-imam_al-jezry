@@ -8,11 +8,28 @@ const {
 
 const router = express.Router();
 
+// المالية متاحة للإدارة العليا والمحاسب فقط.
 router.use(authenticateToken);
 router.use(requireRoles("SUPER_ADMIN", "ACCOUNTANT"));
 
+// التحقق من UUID
+function isValidUUID(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function sendError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message
+  });
+}
+
+// ======================================================
 // GET /api/finance/summary
 // ملخص طلبات الدفع والمبالغ.
+// ======================================================
+
 router.get("/summary", async (req, res) => {
   try {
     const result = await query(
@@ -39,26 +56,38 @@ router.get("/summary", async (req, res) => {
        FROM payment_orders`
     );
 
+    const summary = result.rows[0];
+
     return res.json({
       success: true,
-      summary: result.rows[0],
-      currency: "ETB"
+      currency: "ETB",
+      summary: {
+        pendingOrders: Number(summary.pending_orders),
+        approvedOrders: Number(summary.approved_orders),
+        rejectedOrders: Number(summary.rejected_orders),
+        approvedAmountETB: Number(summary.approved_amount_etb),
+        pendingAmountETB: Number(summary.pending_amount_etb)
+      }
     });
   } catch (error) {
     console.error("Finance summary error:", error.message);
 
-    return res.status(500).json({
-      success: false,
-      message: "تعذر جلب الملخص المالي."
-    });
+    return sendError(
+      res,
+      500,
+      "تعذر جلب الملخص المالي."
+    );
   }
 });
 
-// GET /api/finance/ledger
-// سجل حركات الدقائق مع إمكانية تحديد طالب.
+// ======================================================
+// GET /api/finance/ledger?studentId=<UUID>&limit=100
+// سجل حركات الدقائق.
+// ======================================================
+
 router.get("/ledger", async (req, res) => {
   const studentId = req.query.studentId
-    ? Number(req.query.studentId)
+    ? String(req.query.studentId).trim()
     : null;
 
   const limit = req.query.limit === undefined
@@ -67,19 +96,25 @@ router.get("/ledger", async (req, res) => {
 
   if (
     studentId !== null &&
-    (!Number.isSafeInteger(studentId) || studentId <= 0)
+    !isValidUUID(studentId)
   ) {
-    return res.status(400).json({
-      success: false,
-      message: "رقم الطالب غير صحيح."
-    });
+    return sendError(
+      res,
+      400,
+      "معرّف الطالب غير صحيح."
+    );
   }
 
-  if (!Number.isInteger(limit) || limit < 1 || limit > 300) {
-    return res.status(400).json({
-      success: false,
-      message: "عدد النتائج يجب أن يكون بين 1 و300."
-    });
+  if (
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 300
+  ) {
+    return sendError(
+      res,
+      400,
+      "عدد النتائج يجب أن يكون بين 1 و300."
+    );
   }
 
   try {
@@ -99,9 +134,12 @@ router.get("/ledger", async (req, res) => {
          ml.student_id,
          sp.student_code,
          u.full_name AS student_name,
-         ml.entry_type,
-         ml.amount_minutes,
-         ml.note,
+         ml.payment_order_id,
+         ml.transaction_type,
+         ml.minutes_delta,
+         ml.balance_after,
+         ml.actor_user_id,
+         ml.notes,
          ml.created_at
        FROM minute_ledger ml
        JOIN student_profiles sp
@@ -117,20 +155,36 @@ router.get("/ledger", async (req, res) => {
     return res.json({
       success: true,
       count: result.rows.length,
-      ledger: result.rows
+      ledger: result.rows.map((item) => ({
+        id: item.id,
+        studentId: item.student_id,
+        studentCode: item.student_code,
+        studentName: item.student_name,
+        paymentOrderId: item.payment_order_id,
+        transactionType: item.transaction_type,
+        minutesDelta: Number(item.minutes_delta),
+        balanceAfter: Number(item.balance_after),
+        actorUserId: item.actor_user_id,
+        notes: item.notes,
+        createdAt: item.created_at
+      }))
     });
   } catch (error) {
     console.error("Finance ledger error:", error.message);
 
-    return res.status(500).json({
-      success: false,
-      message: "تعذر جلب سجل الحركات المالية."
-    });
+    return sendError(
+      res,
+      500,
+      "تعذر جلب سجل حركات الدقائق."
+    );
   }
 });
 
-// GET /api/finance/low-balances
-// الطلاب الذين وصل رصيدهم إلى الحد المحدد أو أقل.
+// ======================================================
+// GET /api/finance/low-balances?threshold=10
+// الأرصدة المنخفضة من student_profiles مباشرة.
+// ======================================================
+
 router.get("/low-balances", async (req, res) => {
   const threshold = req.query.threshold === undefined
     ? 10
@@ -141,10 +195,11 @@ router.get("/low-balances", async (req, res) => {
     threshold < 0 ||
     threshold > 10000
   ) {
-    return res.status(400).json({
-      success: false,
-      message: "حد الرصيد غير صحيح."
-    });
+    return sendError(
+      res,
+      400,
+      "حد الرصيد يجب أن يكون عددًا صحيحًا بين 0 و10000."
+    );
   }
 
   try {
@@ -152,17 +207,18 @@ router.get("/low-balances", async (req, res) => {
       `SELECT
          sp.id AS student_id,
          sp.student_code,
+         sp.balance_minutes,
          u.full_name,
          u.phone,
-         ma.balance_minutes
-       FROM minute_accounts ma
-       JOIN student_profiles sp
-         ON sp.id = ma.student_id
+         u.preferred_language
+       FROM student_profiles sp
        JOIN users u
          ON u.id = sp.user_id
-       WHERE ma.balance_minutes <= $1
+       WHERE sp.balance_minutes <= $1
          AND u.is_active = TRUE
-       ORDER BY ma.balance_minutes ASC, u.full_name ASC
+       ORDER BY
+         sp.balance_minutes ASC,
+         u.full_name ASC
        LIMIT 500`,
       [threshold]
     );
@@ -171,15 +227,23 @@ router.get("/low-balances", async (req, res) => {
       success: true,
       thresholdMinutes: threshold,
       count: result.rows.length,
-      students: result.rows
+      students: result.rows.map((student) => ({
+        studentId: student.student_id,
+        studentCode: student.student_code,
+        fullName: student.full_name,
+        phone: student.phone,
+        balanceMinutes: Number(student.balance_minutes),
+        preferredLanguage: student.preferred_language
+      }))
     });
   } catch (error) {
     console.error("Low balance report error:", error.message);
 
-    return res.status(500).json({
-      success: false,
-      message: "تعذر جلب قائمة الأرصدة المنخفضة."
-    });
+    return sendError(
+      res,
+      500,
+      "تعذر جلب قائمة الأرصدة المنخفضة."
+    );
   }
 });
 
