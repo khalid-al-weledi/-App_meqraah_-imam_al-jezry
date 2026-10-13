@@ -37,9 +37,20 @@ function normalizePhone(phone) {
   return phone.replace(/[\s()-]/g, "");
 }
 
+// اللغات المعتمدة: العربية والأمهرية فقط
 function getLanguage(value) {
-  const allowedLanguages = ["ar", "am", "en", "om"];
-  return allowedLanguages.includes(value) ? value : "ar";
+  return ["ar", "am"].includes(value) ? value : "ar";
+}
+
+// إنشاء رمز طالب مرتبط بمعرف UUID
+function generateStudentCode(gender, studentId) {
+  const prefix = gender === "FEMALE" ? "IF" : "IM";
+  const suffix = studentId
+    .replace(/-/g, "")
+    .slice(0, 8)
+    .toUpperCase();
+
+  return `${prefix}-${suffix}`;
 }
 
 // إنشاء حساب طالب جديد
@@ -52,9 +63,10 @@ router.post("/register", async (req, res) => {
 
   const data = checked.data;
   const phone = normalizePhone(data.phone);
+  const language = getLanguage(data.language);
   const programCodes = [...new Set(data.programCodes || [])];
 
-  if (programCodes.length === 0) {
+  if (!programCodes.length) {
     return res.status(400).json({
       success: false,
       message: "يرجى اختيار برنامج واحد على الأقل."
@@ -65,11 +77,18 @@ router.post("/register", async (req, res) => {
     (code) => !PROGRAM_CODES.includes(code)
   );
 
-  if (invalidCodes.length > 0) {
+  if (invalidCodes.length) {
     return res.status(400).json({
       success: false,
       message: "توجد رموز برامج غير صحيحة.",
       invalidCodes
+    });
+  }
+
+  if (!["MALE", "FEMALE"].includes(data.gender)) {
+    return res.status(400).json({
+      success: false,
+      message: "يرجى تحديد الجنس بطريقة صحيحة."
     });
   }
 
@@ -80,6 +99,7 @@ router.post("/register", async (req, res) => {
     await client.query("BEGIN");
     transactionStarted = true;
 
+    // منع التسجيل المكرر برقم الهاتف
     const existing = await client.query(
       `SELECT id
        FROM users
@@ -99,19 +119,17 @@ router.post("/register", async (req, res) => {
     }
 
     const passwordHash = await hashPassword(data.password);
-    const language = getLanguage(data.language);
 
-    // اسم العمود الصحيح في قاعدة البيانات: preferred_language
+    // إنشاء المستخدم باستخدام UUID الافتراضي في قاعدة البيانات
     const userResult = await client.query(
-      `INSERT INTO users
-        (
-          full_name,
-          phone,
-          password_hash,
-          role,
-          preferred_language,
-          is_active
-        )
+      `INSERT INTO users (
+         full_name,
+         phone,
+         password_hash,
+         role,
+         preferred_language,
+         is_active
+       )
        VALUES ($1, $2, $3, 'STUDENT', $4, TRUE)
        RETURNING
          id,
@@ -129,26 +147,28 @@ router.post("/register", async (req, res) => {
 
     const user = userResult.rows[0];
 
-    // إنشاء الملف الشخصي برمز مؤقت داخل المعاملة نفسها
+    // إنشاء ملف الطالب. الرصيد محفوظ في student_profiles نفسه.
     const temporaryCode = `TMP-${randomUUID()}`;
 
     const studentResult = await client.query(
-      `INSERT INTO student_profiles
-        (
-          user_id,
-          student_code,
-          gender,
-          age,
-          country,
-          city,
-          previous_school,
-          previous_teacher,
-          reading_level,
-          has_read_quran_looking,
-          memorized_juz
-        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING id, gender`,
+      `INSERT INTO student_profiles (
+         user_id,
+         student_code,
+         balance_minutes,
+         gender,
+         age,
+         country,
+         city,
+         previous_school,
+         previous_teacher,
+         reading_level,
+         has_read_quran_looking,
+         memorized_juz
+       )
+       VALUES (
+         $1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11
+       )
+       RETURNING id, gender, balance_minutes`,
       [
         user.id,
         temporaryCode,
@@ -159,17 +179,17 @@ router.post("/register", async (req, res) => {
         data.previousSchool ?? null,
         data.previousTeacher ?? null,
         data.readingLevel ?? null,
-        data.hasReadQuranLooking,
-        data.memorizedJuz
+        data.hasReadQuranLooking ?? false,
+        data.memorizedJuz ?? 0
       ]
     );
 
     const student = studentResult.rows[0];
     const studentId = student.id;
-
-    const prefix = student.gender === "FEMALE" ? "IF" : "IM";
-    const studentCode =
-      `${prefix}-${String(studentId).padStart(6, "0")}`;
+    const studentCode = generateStudentCode(
+      student.gender,
+      studentId
+    );
 
     await client.query(
       `UPDATE student_profiles
@@ -178,15 +198,7 @@ router.post("/register", async (req, res) => {
       [studentCode, studentId]
     );
 
-    // إنشاء حساب الدقائق الابتدائي
-    await client.query(
-      `INSERT INTO minute_accounts
-        (student_id, balance_minutes)
-       VALUES ($1, 0)`,
-      [studentId]
-    );
-
-    // التحقق من البرامج المطلوبة باستخدام رموزها الفعلية
+    // التأكد من أن جميع البرامج المطلوبة موجودة ومفعلة
     const programResult = await client.query(
       `SELECT id, code
        FROM programs
@@ -206,7 +218,7 @@ router.post("/register", async (req, res) => {
       (code) => !availablePrograms.has(code)
     );
 
-    if (unavailableCodes.length > 0) {
+    if (unavailableCodes.length) {
       await client.query("ROLLBACK");
       transactionStarted = false;
 
@@ -217,33 +229,32 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // جدول enrollments يستخدم program_id وليس program_code
+    // تسجيل طلب الالتحاق لكل برنامج
     for (const programCode of programCodes) {
-      const programId = availablePrograms.get(programCode);
-
       await client.query(
-        `INSERT INTO enrollments
-          (
-            student_id,
-            program_id,
-            status,
-            requested_at
-          )
+        `INSERT INTO enrollments (
+           student_id,
+           program_id,
+           status,
+           requested_at
+         )
          VALUES ($1, $2, 'PENDING', NOW())`,
-        [studentId, programId]
+        [
+          studentId,
+          availablePrograms.get(programCode)
+        ]
       );
     }
 
     // تسجيل العملية في سجل التدقيق
     await client.query(
-      `INSERT INTO audit_logs
-        (
-          actor_user_id,
-          action,
-          entity_type,
-          entity_id,
-          details
-        )
+      `INSERT INTO audit_logs (
+         actor_user_id,
+         action,
+         entity_type,
+         entity_id,
+         details
+       )
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
       [
         user.id,
@@ -258,13 +269,15 @@ router.post("/register", async (req, res) => {
       ]
     );
 
-    await client.query("COMMIT");
-    transactionStarted = false;
-
+    // إنشاء الرمز قبل اعتماد المعاملة لتجنب نجاح التسجيل
+    // مع فشل إصدار الرمز بسبب إعدادات JWT.
     const token = createToken({
       id: user.id,
       role: user.role
     });
+
+    await client.query("COMMIT");
+    transactionStarted = false;
 
     return res.status(201).json({
       success: true,
@@ -281,6 +294,7 @@ router.post("/register", async (req, res) => {
         id: studentId,
         studentCode,
         gender: student.gender,
+        balanceMinutes: student.balance_minutes,
         status: "PENDING"
       },
       enrollments: programCodes.map((code) => ({
@@ -298,7 +312,7 @@ router.post("/register", async (req, res) => {
     if (error.code === "23505") {
       return res.status(409).json({
         success: false,
-        message: "البيانات مسجلة مسبقًا. تحقق من رقم الهاتف."
+        message: "توجد بيانات مسجلة مسبقًا. تحقق من رقم الهاتف أو أعد المحاولة."
       });
     }
 
@@ -337,7 +351,7 @@ router.post("/login", async (req, res) => {
       [phone]
     );
 
-    if (result.rowCount === 0) {
+    if (!result.rowCount) {
       return res.status(401).json({
         success: false,
         message: "رقم الهاتف أو كلمة المرور غير صحيحة."
@@ -397,7 +411,8 @@ router.get("/me", authenticateToken, async (req, res) => {
          u.preferred_language,
          u.is_active,
          sp.student_code,
-         sp.gender
+         sp.gender,
+         sp.balance_minutes
        FROM users u
        LEFT JOIN student_profiles sp
          ON sp.user_id = u.id
@@ -406,7 +421,7 @@ router.get("/me", authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
-    if (result.rowCount === 0) {
+    if (!result.rowCount) {
       return res.status(404).json({
         success: false,
         message: "الحساب غير موجود."
@@ -425,7 +440,8 @@ router.get("/me", authenticateToken, async (req, res) => {
         language: user.preferred_language,
         isActive: user.is_active,
         studentCode: user.student_code ?? null,
-        gender: user.gender ?? null
+        gender: user.gender ?? null,
+        balanceMinutes: user.balance_minutes ?? null
       }
     });
   } catch (error) {
