@@ -8,27 +8,40 @@ const rateLimit = require("express-rate-limit");
 
 const { checkDatabase } = require("./db");
 
+// API route modules
 const authRoutes = require("./auth-routes");
-const programRoutes = require("./program-routes");
-const paymentRoutes = require("./payment-routes");
+const attendanceRoutes = require("./attendance-routes");
+const enrollmentRoutes = require("./enrollment-routes");
+const examRoutes = require("./exam-routes");
 const financeRoutes = require("./finance-routes");
 const minuteRoutes = require("./minute-routes");
+const notificationRoutes = require("./notification-routes");
+const paymentRoutes = require("./payment-routes");
+const programRoutes = require("./program-routes");
+const reportRoutes = require("./report-routes");
+const sessionRoutes = require("./session-routes");
+const teacherRoutes = require("./teacher-routes");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 
 app.disable("x-powered-by");
 
+// Security headers
 app.use(helmet());
 
+// CORS configuration
 const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(",").map((item) => item.trim())
+  ? process.env.CORS_ORIGIN
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
   : [];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // السماح بالطلبات التي لا تحمل Origin، مثل أدوات فحص API.
+      // Allow requests without an Origin header, such as server-to-server calls.
       if (!origin) {
         return callback(null, true);
       }
@@ -42,8 +55,10 @@ app.use(
   })
 );
 
+// Request body
 app.use(express.json({ limit: "1mb" }));
 
+// Rate limiting
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -57,12 +72,21 @@ app.use(
   })
 );
 
+// API routes
 app.use("/api/auth", authRoutes);
-app.use("/api/programs", programRoutes);
-app.use("/api/payments", paymentRoutes);
+app.use("/api/attendance", attendanceRoutes);
+app.use("/api/enrollments", enrollmentRoutes);
+app.use("/api/exams", examRoutes);
 app.use("/api/finance", financeRoutes);
 app.use("/api/minutes", minuteRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/programs", programRoutes);
+app.use("/api/reports", reportRoutes);
+app.use("/api/sessions", sessionRoutes);
+app.use("/api/teachers", teacherRoutes);
 
+// Root endpoint
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -72,6 +96,7 @@ app.get("/", (req, res) => {
   });
 });
 
+// Basic health check
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -79,14 +104,16 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Database health check
 app.get("/health/database", async (req, res) => {
   try {
-    await checkDatabase();
+    const database = await checkDatabase();
 
     return res.json({
       success: true,
       status: "ok",
-      database: "connected"
+      database: "connected",
+      databaseName: database.database_name
     });
   } catch (error) {
     console.error("Database health check failed:", error.message);
@@ -100,6 +127,7 @@ app.get("/health/database", async (req, res) => {
   }
 });
 
+// Not found
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -107,6 +135,7 @@ app.use((req, res) => {
   });
 });
 
+// Global error handler
 app.use((error, req, res, next) => {
   if (res.headersSent) {
     return next(error);
@@ -127,6 +156,7 @@ app.use((error, req, res, next) => {
   });
 });
 
+// Start server only when executed directly
 if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`Maqraah API listening on port ${PORT}`);
@@ -136,7 +166,9 @@ if (require.main === module) {
       console.log("Database connection verified.");
     } catch (error) {
       console.error("Database connection failed:", error.message);
-      console.error("The API is running, but database operations may fail.");
+      console.error(
+        "The API is running, but database operations may fail."
+      );
     }
   });
 }
