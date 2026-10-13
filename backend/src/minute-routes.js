@@ -23,7 +23,25 @@ async function getStudentId(userId) {
   return result.rows[0]?.id ?? null;
 }
 
-// رصيد الطالب وسجل حركات الدقائق
+async function getBalance(studentId) {
+  const result = await pool.query(
+    `SELECT
+       sp.id,
+       COALESCE(ma.balance_minutes, sp.balance_minutes, 0)
+         AS balance_minutes,
+       sp.created_at
+     FROM student_profiles sp
+     LEFT JOIN minute_accounts ma
+       ON ma.student_id = sp.id
+     WHERE sp.id = $1
+     LIMIT 1`,
+    [studentId]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+// رصيد الطالب وسجل حركات الدقائق.
 router.get(
   "/my-balance",
   authenticateToken,
@@ -39,15 +57,7 @@ router.get(
         });
       }
 
-      const result = await pool.query(
-        `SELECT
-           balance_minutes,
-           created_at
-         FROM student_profiles
-         WHERE id = $1
-         LIMIT 1`,
-        [studentId]
-      );
+      const result = await getBalance(studentId);
 
       const history = await pool.query(
         `SELECT
@@ -67,11 +77,12 @@ router.get(
 
       return res.json({
         success: true,
-        balanceMinutes: Number(result.rows[0].balance_minutes),
+        balanceMinutes: Number(result.balance_minutes),
         history: history.rows
       });
     } catch (error) {
       console.error("Get minute balance failed:", error.message);
+
       return res.status(500).json({
         success: false,
         message: "تعذر جلب رصيد الدقائق."
@@ -80,7 +91,7 @@ router.get(
   }
 );
 
-// رصيد طالب محدد للإدارة والمحاسب
+// رصيد طالب محدد للإدارة والمحاسب.
 router.get(
   "/admin/student/:studentId",
   authenticateToken,
@@ -88,7 +99,8 @@ router.get(
   async (req, res) => {
     const studentId = req.params.studentId;
 
-    if (!UUID_PATTERN.test(studentId)) {
+    // المعرّف هنا هو student_profiles.id وقد يكون رقميًا في قاعدة البيانات.
+    if (!/^[1-9]\d*$/.test(studentId)) {
       return res.status(400).json({
         success: false,
         message: "معرّف الطالب غير صالح."
@@ -100,12 +112,15 @@ router.get(
         `SELECT
            sp.id AS student_id,
            sp.student_code,
-           sp.balance_minutes,
+           COALESCE(ma.balance_minutes, sp.balance_minutes, 0)
+             AS balance_minutes,
            sp.created_at,
            u.full_name,
            u.phone
          FROM student_profiles sp
          JOIN users u ON u.id = sp.user_id
+         LEFT JOIN minute_accounts ma
+           ON ma.student_id = sp.id
          WHERE sp.id = $1
          LIMIT 1`,
         [studentId]
@@ -151,6 +166,7 @@ router.get(
       });
     } catch (error) {
       console.error("Admin minute balance failed:", error.message);
+
       return res.status(500).json({
         success: false,
         message: "تعذر جلب بيانات رصيد الطالب."
