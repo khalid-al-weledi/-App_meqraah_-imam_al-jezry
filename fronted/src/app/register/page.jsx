@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useState } from "react";
@@ -18,13 +19,29 @@ export default function RegisterPage() {
     const form = new FormData(formElement);
     const payload = Object.fromEntries(form.entries());
 
-    payload.age = payload.age ? Number(payload.age) : undefined;
+    // Convert numeric fields
+    payload.age = payload.age
+      ? Number(payload.age)
+      : undefined;
+
     payload.memorizedJuz = payload.memorizedJuz
       ? Number(payload.memorizedJuz)
       : 0;
+
+    // Convert the form's string value to a boolean
     payload.hasReadQuranLooking =
       payload.hasReadQuranLooking === "true";
-    payload.preferredLanguage = language;
+
+    // Match the backend registration schema
+    payload.language = language;
+
+    // The form uses one programCode, while the API expects an array
+    payload.programCodes = payload.programCode
+      ? [payload.programCode]
+      : [];
+
+    delete payload.programCode;
+    delete payload.preferredLanguage;
 
     setMessage("");
     setError(false);
@@ -148,7 +165,7 @@ export default function RegisterPage() {
               id="age"
               name="age"
               type="number"
-              min="5"
+              min="3"
               max="120"
             />
           </div>
@@ -256,7 +273,9 @@ export default function RegisterPage() {
             disabled={busy}
             style={{ width: "100%", marginTop: 8 }}
           >
-            {busy ? "جارٍ الإرسال..." : "إرسال طلب التسجيل"}
+            {busy
+              ? "جارٍ الإرسال..."
+              : "إرسال طلب التسجيل"}
           </button>
         </form>
 
@@ -270,8 +289,8 @@ export default function RegisterPage() {
         )}
 
         <p className="muted">
-          تنبيه تقني: يجب مطابقة أسماء الحقول ومسار
-          `/auth/register` مع API الفعلي قبل اعتماد التسجيل.
+          تنبيه: نجاح إرسال الطلب يعتمد أيضًا على إعدادات
+          الخادم وقاعدة البيانات.
         </p>
       </section>
     </main>
