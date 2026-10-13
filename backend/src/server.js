@@ -8,14 +8,17 @@ const rateLimit = require("express-rate-limit");
 
 const { checkDatabase } = require("./db");
 const authRoutes = require("./auth-routes");
+const programRoutes = require("./program-routes");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 
 app.disable("x-powered-by");
 
+// الحماية الأساسية
 app.use(helmet());
 
+// إعداد الاتصال بالواجهات
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN
@@ -26,9 +29,10 @@ app.use(
   })
 );
 
+// قراءة بيانات JSON
 app.use(express.json({ limit: "1mb" }));
 
-// حماية واجهات API من كثرة الطلبات
+// الحد من الطلبات المتكررة
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -42,8 +46,11 @@ app.use(
   })
 );
 
-// واجهات التسجيل وتسجيل الدخول
+// واجهات التسجيل وتسجيل الدخول والحساب
 app.use("/api/auth", authRoutes);
+
+// واجهات البرامج التعليمية
+app.use("/api/programs", programRoutes);
 
 // الصفحة الرئيسية
 app.get("/", (req, res) => {
@@ -89,7 +96,7 @@ app.get("/health/database", async (req, res) => {
   }
 });
 
-// أي مسار غير معروف
+// المسارات غير الموجودة
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -111,6 +118,7 @@ app.use((error, req, res, next) => {
   });
 });
 
+// تشغيل الخادم
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(
