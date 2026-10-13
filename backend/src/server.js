@@ -7,17 +7,22 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
 const { checkDatabase } = require("./db");
+
 const authRoutes = require("./auth-routes");
 const programRoutes = require("./program-routes");
 const paymentRoutes = require("./payment-routes");
+const financeRoutes = require("./finance-routes");
+const minuteRoutes = require("./minute-routes");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 
 app.disable("x-powered-by");
 
+// Security headers
 app.use(helmet());
 
+// CORS configuration
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN
@@ -28,8 +33,10 @@ app.use(
   })
 );
 
+// Request body
 app.use(express.json({ limit: "1mb" }));
 
+// Rate limiting
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -43,24 +50,24 @@ app.use(
   })
 );
 
-// ربط ملفات النظام
+// API routes
 app.use("/api/auth", authRoutes);
 app.use("/api/programs", programRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/finance", financeRoutes);
+app.use("/api/minutes", minuteRoutes);
 
-// الصفحة الرئيسية
+// Root endpoint
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    name:
-      process.env.APP_NAME ||
-      "مقرأة الإمام الجزري للإقراء والإجازة بالسند",
-    message: "خادم المقرأة يعمل.",
+    name: "Imam Al-Jazari Maqraah API",
+    message: "خادم مقرأة الإمام الجزري يعمل.",
     version: "1.0.0"
   });
 });
 
-// فحص الخادم
+// Basic health check
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -68,31 +75,27 @@ app.get("/health", (req, res) => {
   });
 });
 
-// فحص قاعدة البيانات
+// Database health check
 app.get("/health/database", async (req, res) => {
   try {
-    const database = await checkDatabase();
+    await checkDatabase();
 
-    res.json({
+    return res.json({
       success: true,
-      status: "connected",
-      database: database.database_name
+      database: "connected"
     });
   } catch (error) {
-    console.error(
-      "Database health check failed:",
-      error.message
-    );
+    console.error("Database health check failed:", error.message);
 
-    res.status(503).json({
+    return res.status(503).json({
       success: false,
-      status: "unavailable",
+      database: "unavailable",
       message: "تعذر الاتصال بقاعدة البيانات."
     });
   }
 });
 
-// المسارات غير الموجودة
+// Not found
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -100,25 +103,24 @@ app.use((req, res) => {
   });
 });
 
-// معالجة الأخطاء
+// Global error handler
 app.use((error, req, res, next) => {
-  console.error("Server error:", error.message);
+  console.error("Unhandled server error:", error.message);
 
   if (res.headersSent) {
     return next(error);
   }
 
-  res.status(500).json({
+  return res.status(500).json({
     success: false,
     message: "حدث خطأ داخلي في الخادم."
   });
 });
 
+// Start server only when executed directly
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(
-      `Maqraah backend listening on port ${PORT}`
-    );
+    console.log(`Maqraah API listening on port ${PORT}`);
   });
 }
 
