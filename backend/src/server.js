@@ -19,24 +19,31 @@ const PORT = Number(process.env.PORT) || 4000;
 
 app.disable("x-powered-by");
 
-// Security headers
 app.use(helmet());
 
-// CORS configuration
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((item) => item.trim())
+  : [];
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN
-          .split(",")
-          .map((item) => item.trim())
-      : false
+    origin(origin, callback) {
+      // السماح بالطلبات التي لا تحمل Origin، مثل أدوات فحص API.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not allowed by CORS"));
+    }
   })
 );
 
-// Request body
 app.use(express.json({ limit: "1mb" }));
 
-// Rate limiting
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -50,14 +57,12 @@ app.use(
   })
 );
 
-// API routes
 app.use("/api/auth", authRoutes);
 app.use("/api/programs", programRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/finance", financeRoutes);
 app.use("/api/minutes", minuteRoutes);
 
-// Root endpoint
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -67,7 +72,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Basic health check
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -75,13 +79,13 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Database health check
 app.get("/health/database", async (req, res) => {
   try {
     await checkDatabase();
 
     return res.json({
       success: true,
+      status: "ok",
       database: "connected"
     });
   } catch (error) {
@@ -89,13 +93,13 @@ app.get("/health/database", async (req, res) => {
 
     return res.status(503).json({
       success: false,
+      status: "error",
       database: "unavailable",
       message: "تعذر الاتصال بقاعدة البيانات."
     });
   }
 });
 
-// Not found
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -103,13 +107,19 @@ app.use((req, res) => {
   });
 });
 
-// Global error handler
 app.use((error, req, res, next) => {
-  console.error("Unhandled server error:", error.message);
-
   if (res.headersSent) {
     return next(error);
   }
+
+  if (error.message === "Origin not allowed by CORS") {
+    return res.status(403).json({
+      success: false,
+      message: "مصدر الطلب غير مسموح."
+    });
+  }
+
+  console.error("Unhandled server error:", error.message);
 
   return res.status(500).json({
     success: false,
@@ -117,10 +127,17 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Start server only when executed directly
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log(`Maqraah API listening on port ${PORT}`);
+
+    try {
+      await checkDatabase();
+      console.log("Database connection verified.");
+    } catch (error) {
+      console.error("Database connection failed:", error.message);
+      console.error("The API is running, but database operations may fail.");
+    }
   });
 }
 
