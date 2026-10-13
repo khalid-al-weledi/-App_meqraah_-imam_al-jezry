@@ -15,25 +15,63 @@ const ALLOWED_PROGRAM_CODES = [
   "SEVEN_QIRAAT"
 ];
 
+// ترتيب عرض البرامج دون الحاجة إلى عمود sort_order
+const PROGRAM_ORDER = [
+  "TALQEEN_CORRECTION",
+  "QURAN_HIFZ",
+  "HAFS_IJAZAH",
+  "SEVEN_QIRAAT"
+];
+
+function orderPrograms(rows) {
+  const order = new Map(
+    PROGRAM_ORDER.map((code, index) => [code, index])
+  );
+
+  return rows.sort((a, b) => {
+    const aOrder = order.get(a.code) ?? 999;
+    const bOrder = order.get(b.code) ?? 999;
+
+    return aOrder - bOrder || a.code.localeCompare(b.code);
+  });
+}
+
 // عرض البرامج النشطة للطلاب والزوار
 router.get("/", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
+         id,
          code,
          name_ar,
          name_en,
          description_ar,
-         description_en,
          is_active
        FROM programs
        WHERE is_active = TRUE
-       ORDER BY sort_order ASC, code ASC`
-    );
+       ORDER BY code ASC`
+    ).catch(async (error) => {
+      // توافق احتياطي إذا لم يوجد عمود name_en
+      if (error.code !== "42703") {
+        throw error;
+      }
+
+      return pool.query(
+        `SELECT
+           id,
+           code,
+           name_ar,
+           description_ar,
+           is_active
+         FROM programs
+         WHERE is_active = TRUE
+         ORDER BY code ASC`
+      );
+    });
 
     return res.json({
       success: true,
-      programs: result.rows
+      programs: orderPrograms(result.rows)
     });
   } catch (error) {
     console.error("List programs failed:", error.message);
@@ -54,20 +92,19 @@ router.get(
     try {
       const result = await pool.query(
         `SELECT
+           id,
            code,
            name_ar,
-           name_en,
            description_ar,
-           description_en,
            is_active,
-           sort_order
+           created_at
          FROM programs
-         ORDER BY sort_order ASC, code ASC`
+         ORDER BY code ASC`
       );
 
       return res.json({
         success: true,
-        programs: result.rows
+        programs: orderPrograms(result.rows)
       });
     } catch (error) {
       console.error("Admin list programs failed:", error.message);
@@ -106,10 +143,14 @@ router.patch(
     try {
       const result = await pool.query(
         `UPDATE programs
-         SET is_active = $1,
-             updated_at = NOW()
+         SET is_active = $1
          WHERE code = $2
-         RETURNING code, name_ar, name_en, is_active`,
+         RETURNING
+           id,
+           code,
+           name_ar,
+           description_ar,
+           is_active`,
         [isActive, code]
       );
 
