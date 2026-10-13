@@ -23,6 +23,14 @@ const optionalText = (maxLength) =>
       value === "" ? undefined : value
     );
 
+// Supported study programs
+const programCodeSchema = z.enum([
+  "TALQEEN_CORRECTION",
+  "QURAN_HIFZ",
+  "HAFS_IJAZAH",
+  "SEVEN_QIRAAT"
+]);
+
 // Registration validation
 const registerSchema = z
   .object({
@@ -39,7 +47,7 @@ const registerSchema = z
       .min(10, "كلمة المرور يجب ألا تقل عن 10 أحرف.")
       .max(128),
 
-    // Supported languages: Arabic and Amharic only
+    // Arabic and Amharic only
     language: z
       .enum(["ar", "am"])
       .default("ar"),
@@ -56,6 +64,9 @@ const registerSchema = z
     country: optionalText(100),
 
     city: optionalText(100),
+
+    // Previous city and education details
+    previousCity: optionalText(100),
 
     previousSchool: optionalText(200),
 
@@ -85,14 +96,7 @@ const registerSchema = z
 
     // Selected study programs
     programCodes: z
-      .array(
-        z.enum([
-          "TALQEEN_CORRECTION",
-          "QURAN_HIFZ",
-          "HAFS_IJAZAH",
-          "SEVEN_QIRAAT"
-        ])
-      )
+      .array(programCodeSchema)
       .min(1, "يرجى اختيار برنامج واحد على الأقل.")
       .max(4)
       .refine(
@@ -117,12 +121,7 @@ const loginSchema = z
 // Enrollment validation
 const enrollmentSchema = z
   .object({
-    programCode: z.enum([
-      "TALQEEN_CORRECTION",
-      "QURAN_HIFZ",
-      "HAFS_IJAZAH",
-      "SEVEN_QIRAAT"
-    ])
+    programCode: programCodeSchema
   })
   .strict();
 
